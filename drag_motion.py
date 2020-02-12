@@ -9,7 +9,7 @@ Yaw changes from yaw0 to yaw1
 How do I control thrust effort (forward, strafe, yaw) to achieve this?
 """
 
-from math import cos, sin, atan2, pi
+from math import cos, sin, atan2, pi, hypot, sqrt
 
 import matplotlib.pyplot as plt
 
@@ -88,7 +88,8 @@ BOLLARD_FORCE = 1.
 DRAG_COEF_FORWARD = 0.1
 DRAG_COEF_STRAFE = 0.2
 
-TARGET_V = 1.  # Target velocity
+XY_TARGET_V = 1.  # Target xy velocity in m/s
+YAW_TARGET_V = 0.5  # Target yaw velocity in r/s
 DT = 0.1
 
 
@@ -173,8 +174,8 @@ def constant_thrust(plotter: Plotter, x0, y0, x1, y1, yaw0):
     angle_to_goal = atan2(y1 - y0, x1 - x0)
     print('angle to goal', angle_to_goal)
 
-    target_vx = cos(angle_to_goal) * TARGET_V
-    target_vy = sin(angle_to_goal) * TARGET_V
+    target_vx = cos(angle_to_goal) * XY_TARGET_V
+    target_vy = sin(angle_to_goal) * XY_TARGET_V
     print('target_vx', target_vx)
     print('target_vy', target_vy)
 
@@ -250,54 +251,136 @@ def constant_thrust(plotter: Plotter, x0, y0, x1, y1, yaw0):
         plotter.ys.append(y)
 
 
-def constant_acceleration(plotter: Plotter, x0, y0, x1, y1, yaw0):
+XY_A = 0.25  # Acceleration rate in m / s^2
+YAW_A = 1.  # Acceleration rate in r / s^2
+
+
+def plan(acceleration, max_velocity, distance):
     """
-    Constant acceleration, works well for any drag configuration
+    Plan a 3-phase motion that runs a distance constrained by acceleration and max_velocity:
+        phase 1: accelerate
+        phase 2: run at constant velocity
+        phase 3: decelerate and stop
 
-    TODO stop at x1, y1, yaw1 -- do this by time? Or distance?
-    TODO vary yaw from yaw0 to yaw1
-    TODO implement a velocity ramp down in last segment
+    Return 3 times:
+        (start_ramp_up_t is always 0)
+        start_run_t
+        start_ramp_down_t
+        stop_t
+
+    If the distance is short, start_run_t == start_ramp_down_t (run phase is skipped)
     """
 
-    # Direction of motion
-    angle_to_goal = atan2(y1 - y0, x1 - x0)
-    print('angle to goal', angle_to_goal)
+    ramp_duration = max_velocity / acceleration
+    ramp_distance = 1 / 2 * acceleration * ramp_duration * ramp_duration
 
-    target_vx = cos(angle_to_goal) * TARGET_V
-    target_vy = sin(angle_to_goal) * TARGET_V
-    print('target_vx', target_vx)
-    print('target_vy', target_vy)
+    if 2 * ramp_distance < distance:
+        # Will hit target_velocity
+        run_duration = (distance - 2 * ramp_distance) / max_velocity
+    else:
+        # Will not hit target_velocity
+        ramp_duration = sqrt(distance / acceleration)
+        run_duration = 0
 
-    # Velocity ramp length, in seconds
-    velocity_ramp_t = 5.
+    print('ramp_duration', ramp_duration, 'run_duration', run_duration)
 
-    # Total acceleration during the velocity ramp
-    ax = target_vx / velocity_ramp_t
-    ay = target_vy / velocity_ramp_t
+    start_run_t = ramp_duration
+    start_ramp_down_t = start_run_t + run_duration
+    stop_t = start_ramp_down_t + ramp_duration
 
-    # Start velocity
-    vx = 0.
-    vy = 0.
+    return start_run_t, start_ramp_down_t, stop_t
 
-    # Start position
-    x = x0
-    y = y0
+
+def constant_velocity(plotter: Plotter, x0, y0, x1, y1, yaw0, yaw1):
+    """
+    Constant velocity (with ramp up / down), works well for any drag configuration
+
+    Run yaw and xy motion at the same time
+    The loop stops when both motions are complete
+
+    Future: slow down the fastest motion so that all motions complete at the same time
+    """
+
+    # Plan yaw motion
+    yaw_start_run_t, yaw_start_ramp_down_t, yaw_stop_t = plan(YAW_A, YAW_TARGET_V, norm_angle(yaw1 - yaw0))
+
+    # Start yaw acceleration
+    ayaw = YAW_A
+
+    # Start yaw velocity
+    vyaw = 0.
 
     # Start yaw
     yaw = yaw0
 
+    # Plan xy motion
+    xy_distance = hypot(x1 - x0, y1 - y0)
+    xy_start_run_t, xy_start_ramp_down_t, xy_stop_t = plan(XY_A, XY_TARGET_V, xy_distance)
+
+    # Split xy velocity into x and y components
+    angle_to_goal = atan2(y1 - y0, x1 - x0)
+    print('angle to goal', angle_to_goal)
+    target_vx = cos(angle_to_goal) * XY_TARGET_V
+    target_vy = sin(angle_to_goal) * XY_TARGET_V
+    print('target_vx', target_vx)
+    print('target_vy', target_vy)
+
+    # Start x and y acceleration
+    if xy_distance > 0:
+        ax = target_vx / xy_start_run_t
+        ay = target_vy / xy_start_run_t
+    else:
+        ax = 0
+        ay = 0
+
+    # Start x and y velocity
+    vx = 0.
+    vy = 0.
+
+    # Start x and y
+    x = x0
+    y = y0
+
     # Start time
     t = 0
 
-    for i in range(200):
+    while t < yaw_stop_t or t < xy_stop_t:
+
+        ###################
+        # Time
+        ###################
+
         t += DT
 
         plotter.ts.append(t)
 
-        # Spin around while moving
-        yaw = norm_angle(yaw + 0.05)
+        ###################
+        # Yaw motion
+        # Future: deal with yaw drag
+        ###################
+
+        # Velocity
+        vyaw += ayaw * DT
+
+        # Position
+        yaw = norm_angle(yaw + vyaw * DT)
 
         plotter.yaws.append(yaw / pi * 180.)
+
+        if t > yaw_stop_t:
+            # Done
+            ayaw = 0
+            vyaw = 0
+        elif t > yaw_start_ramp_down_t:
+            # Enter velocity ramp down phase
+            ayaw = -YAW_TARGET_V / yaw_start_run_t
+        elif t > yaw_start_run_t:
+            # Enter run phase
+            ayaw = 0
+
+        ###################
+        # X and Y motion
+        ###################
 
         # Drag depends on yaw and direction of motion
         drag_coef_x, drag_coef_y = drag_coef_world(yaw, angle_to_goal)
@@ -337,13 +420,6 @@ def constant_acceleration(plotter: Plotter, x0, y0, x1, y1, yaw0):
         plotter.vxs.append(vx)
         plotter.vys.append(vy)
 
-        # When we hit target velocity, set acceleration = 0
-        # This should happen at the same time!
-        if vx >= target_vx or vx <= -target_vx:
-            ax = 0
-        if vy >= target_vy or vy <= -target_vy:
-            ay = 0
-
         # Position
         x += vx * DT
         y += vy * DT
@@ -351,12 +427,35 @@ def constant_acceleration(plotter: Plotter, x0, y0, x1, y1, yaw0):
         plotter.xs.append(x)
         plotter.ys.append(y)
 
+        if t > xy_stop_t:
+            # Done
+            ax = 0
+            ay = 0
+            vx = 0
+            vy = 0
+        elif t > xy_start_ramp_down_t:
+            # Enter velocity ramp down phase
+            ax = -target_vx / xy_start_run_t
+            ay = -target_vy / xy_start_run_t
+        elif t > xy_start_run_t:
+            # Enter run phase
+            ax = 0
+            ay = 0
+
 
 def main():
     plotter = Plotter()
 
-    constant_thrust(plotter, 0., 0., 10., 10., 0.)
-    # constant_acceleration(plotter, 0., 0., 10., 10., 0.)
+    # constant_thrust(plotter, 0., 0., 10., 10., 0.)
+    
+    constant_velocity(plotter, 0., 0., 10., 10., 0., pi)  # x, y and yaw
+    # constant_velocity(plotter, 0., 0., 10., 10., 0., 0.)  # x and y
+    # constant_velocity(plotter, 0., 0., 10., 0., 0., pi)  # x and yaw
+    # constant_velocity(plotter, 0., 0., 0., 10., 0., pi)  # y and yaw
+    # constant_velocity(plotter, 0., 0., 10., 0., 0., 0.)  # Just x
+    # constant_velocity(plotter, 0., 0., 0., 10., 0., 0.)  # Just y
+    # constant_velocity(plotter, 0., 0., 0., 0., 0., pi)  # Just yaw
+    # constant_velocity(plotter, 0., 0., 0., 0., 0., 0.)  # Nothing
 
     plotter.plot()
 
